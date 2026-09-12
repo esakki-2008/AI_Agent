@@ -3,6 +3,7 @@ import AnimatedCursor from './components/AnimatedCursor'
 import ProjectShowcase from './components/ProjectShowcase'
 import ScrollReveal from './components/ScrollReveal'
 import AdminPanel from './components/AdminPanel'
+import './admin.css'
 
 const words = ['different.', 'alive.', 'memorable.']
 const services = [{ number: '01', title: 'Digital Strategy', text: 'Turn ambitious ideas into clear digital direction.' }, { number: '02', title: 'Brand Systems', text: 'Build a visual language people remember instantly.' }, { number: '03', title: 'Interactive Web', text: 'Create responsive experiences that react to people.' }]
