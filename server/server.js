@@ -26,7 +26,6 @@ app.patch('/api/services/:id',(req,res)=>{const data=load();const item=data.serv
 app.post('/api/inquiries',(req,res)=>{if(!req.body.name||!req.body.email||!req.body.message)return res.status(400).json({error:'Name, email and message are required'});const data=load();const item={id:id(),name:req.body.name,email:req.body.email,message:req.body.message,createdAt:new Date().toISOString()};data.inquiries.unshift(item);save(data);res.status(201).json({success:true,item})})
 app.get('/api/inquiries',(_,res)=>res.json(load().inquiries))
 app.delete('/api/inquiries',(_,res)=>{const data=load();data.inquiries=[];save(data);res.status(204).end()})
-
-const dist = join(ROOT, 'dist')
-if (existsSync(dist)) { app.use(express.static(dist)); app.get('*', (_, res) => res.sendFile(join(dist, 'index.html'))) }
+const dist=join(ROOT,'dist')
+if(existsSync(dist)){app.use(express.static(dist));app.get(/.*/,(_,res)=>res.sendFile(join(dist,'index.html')))}
 app.listen(PORT,()=>console.log(`API running at http://localhost:${PORT}`))
