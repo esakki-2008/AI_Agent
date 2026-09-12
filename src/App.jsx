@@ -3,12 +3,12 @@ import AnimatedCursor from './components/AnimatedCursor'
 import ProjectShowcase from './components/ProjectShowcase'
 import ScrollReveal from './components/ScrollReveal'
 import AdminPanel from './components/AdminPanel'
+import ContactForm from './components/ContactForm'
 import './admin.css'
 
 const words = ['different.', 'alive.', 'memorable.']
 const services = [{ number: '01', title: 'Digital Strategy', text: 'Turn ambitious ideas into clear digital direction.' }, { number: '02', title: 'Brand Systems', text: 'Build a visual language people remember instantly.' }, { number: '03', title: 'Interactive Web', text: 'Create responsive experiences that react to people.' }]
 const stats = [['24', 'Projects launched'], ['11', 'Industries explored'], ['07', 'Years creating']]
-
 function TiltCard({ children }) { function move(e) { const r=e.currentTarget.getBoundingClientRect(); const x=((e.clientX-r.left)/r.width-.5)*8; const y=((e.clientY-r.top)/r.height-.5)*-8; e.currentTarget.style.transform=`perspective(800px) rotateX(${y}deg) rotateY(${x}deg) translateY(-4px)` } function leave(e){e.currentTarget.style.transform=''} return <div onMouseMove={move} onMouseLeave={leave}>{children}</div> }
 
 export default function App() {
@@ -27,6 +27,6 @@ export default function App() {
     <section id="work" className="work-wrap"><ScrollReveal><ProjectShowcase/></ScrollReveal></section>
     <section id="services" className="services-section"><ScrollReveal className="section-heading"><p className="section-index">02 — WHAT WE DO</p><h2>Built to move<br/><span>your brand forward.</span></h2></ScrollReveal><div className="service-list">{services.map(s=><ScrollReveal key={s.number}><TiltCard><article className="service-card"><span className="service-number">{s.number}</span><div><h3>{s.title}</h3><p>{s.text}</p></div><span className="service-arrow">↗</span></article></TiltCard></ScrollReveal>)}</div></section>
     <ScrollReveal><section id="about" className="intro-block"><p className="section-index">03 — THE APPROACH</p><h2>Static is easy.<br/><span>We build experiences.</span></h2><div className="stats">{stats.map(([v,l])=><div className="stat" key={l}><strong>{v}<small>+</small></strong><span>{l}</span></div>)}</div></section></ScrollReveal>
-    <section id="contact" className="contact-preview"><ScrollReveal><p>Have a bold idea?</p><a href="mailto:hello@example.com">Let’s make it real <span>↗</span></a></ScrollReveal><div className="contact-foot"><span>ATELIER. / DIGITAL STUDIO</span><span>INDIA · WORLDWIDE</span></div></section>
+    <section id="contact" className="contact-preview"><ScrollReveal><p>Have a bold idea?</p><h2>Let’s make it real <span>↗</span></h2><ContactForm/></ScrollReveal><div className="contact-foot"><span>ATELIER. / DIGITAL STUDIO</span><span>INDIA · WORLDWIDE</span></div></section>
   </main>
 }
