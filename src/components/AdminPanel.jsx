@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-const API='http://localhost:4000/api'
+const API=import.meta.env.VITE_API_URL||'/api'
 const seedProjects=[{id:1,title:'NOVA HOUSE',type:'Hospitality',year:'2026',status:'Published',description:'A cinematic hospitality experience built around space, light and movement.',image:''},{id:2,title:'MONO FORM',type:'Architecture',year:'2026',status:'Published',description:'A minimal digital identity for a modern architecture practice.',image:''},{id:3,title:'ORBITAL',type:'Technology',year:'2025',status:'Draft',description:'A bold interface system for the next generation of technology.',image:''},{id:4,title:'SORA',type:'Lifestyle',year:'2025',status:'Published',description:'A warm, expressive digital home for a lifestyle brand.',image:''}]
 const seedServices=[{id:'strategy',title:'Digital Strategy',text:'Turn ambitious ideas into clear digital direction.',enabled:true},{id:'brand',title:'Brand Systems',text:'Build a visual language people remember instantly.',enabled:true},{id:'web',title:'Interactive Web',text:'Create responsive experiences that react to people.',enabled:true}]
 const seedSettings={heroLine:'We make digital',heroWord:'different.',heroText:'Strategy, identity and interactive experiences for ambitious brands that refuse to blend in.'}
