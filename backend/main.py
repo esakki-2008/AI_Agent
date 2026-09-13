@@ -22,7 +22,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLIPS = 5
 
-app = FastAPI(title="ClipForge AI", version="1.4.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
+app = FastAPI(title="ClipForge AI", version="1.5.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -58,11 +58,12 @@ def probe_video(path: Path) -> tuple[float, bool]:
 def transcribe(path: Path) -> dict:
     try:
         import whisper
+        import torch
         model = whisper.load_model("base")
         return model.transcribe(str(path), fp16=False, verbose=False)
     except Exception as exc:
         print(f"Whisper unavailable/failed: {exc}")
-        return {"text": "", "segments": []}
+        return {"text": "", "segments": [], "error": str(exc)}
 
 
 def score_segment(text: str) -> int:
@@ -172,9 +173,7 @@ def _youtube_runtime_args() -> list[str]:
 
 def _yt_dlp_format_candidates() -> list[str]:
     return [
-        # Best available separate video + English/original audio.
         "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]",
-        # Single-file fallback for environments where only muxed streams are exposed.
         "best[height<=1080][ext=mp4]/best[height<=720]/best",
     ]
 
@@ -264,12 +263,15 @@ def process_file(input_file: Path, job_id: str) -> dict:
             "duration": round(h["duration"], 2),
             "download_url": f"/download/{output.name}",
         })
-    return {"status": "completed", "job_id": job_id, "has_audio": audio, "transcript": transcription.get("text", ""), "number_of_clips": len(clips), "clips": clips}
+    result = {"status": "completed", "job_id": job_id, "has_audio": audio, "transcript": transcription.get("text", ""), "number_of_clips": len(clips), "clips": clips}
+    if transcription.get("error"):
+        result["warning"] = "Whisper could not transcribe this video: " + transcription["error"]
+    return result
 
 
 @app.get("/")
 def home():
-    return {"status": "running", "service": "ClipForge AI", "version": "1.4.0"}
+    return {"status": "running", "service": "ClipForge AI", "version": "1.5.0"}
 
 
 @app.get("/health")
