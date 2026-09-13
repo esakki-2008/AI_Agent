@@ -1,15 +1,20 @@
-from pathlib import Path
+from __future__ import annotations
+
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
+from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import imageio_ffmpeg
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
-import imageio_ffmpeg
+from pydantic import BaseModel, Field, HttpUrl
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -18,273 +23,263 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG_DIR = str(Path(FFMPEG).parent)
+if FFMPEG_DIR not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
+
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLIPS = 5
+MIN_CLIP_SECONDS = 15
+MAX_CLIP_SECONDS = 60
 
-app = FastAPI(title="ClipForge AI", version="1.5.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="ClipForge AI", version="2.0.0", description="Local AI YouTube-to-Shorts generator. No API key required.")
+origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+JOBS: dict[str, dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
+
+class ProcessOptions(BaseModel):
+    num_clips: int = Field(default=3, ge=1, le=MAX_CLIPS)
+    clip_duration: int = Field(default=30, ge=MIN_CLIP_SECONDS, le=MAX_CLIP_SECONDS)
+    captions: bool = True
 
 class YouTubeRequest(BaseModel):
     url: HttpUrl
+    options: ProcessOptions = Field(default_factory=ProcessOptions)
 
+def update_job(job_id: str, **values: Any) -> None:
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(values)
 
-def run_command(command: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+def run_command(command: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-6000:] or "Command failed")
+        raise RuntimeError(result.stderr[-8000:] or "Command failed")
     return result
 
-
-def run_ffmpeg(args: list[str]) -> subprocess.CompletedProcess:
+def run_ffmpeg(args: list[str]) -> subprocess.CompletedProcess[str]:
     return run_command([FFMPEG, *args])
 
-
-def probe_video(path: Path) -> tuple[float, bool]:
-    result = subprocess.run([FFMPEG, "-i", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def probe_video(path: Path) -> tuple[float, bool, int, int]:
+    result = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", result.stderr)
     if not match:
         raise RuntimeError("Could not read video duration")
     duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
-    return duration, bool(re.search(r"Stream .*?: Audio:", result.stderr))
+    video = re.search(r"Stream #.*?: Video:.*?(\d{2,5})x(\d{2,5})", result.stderr)
+    width, height = (int(video.group(1)), int(video.group(2))) if video else (1920, 1080)
+    has_audio = bool(re.search(r"Stream #.*?: Audio:", result.stderr))
+    return duration, has_audio, width, height
 
-
-def transcribe(path: Path) -> dict:
+def transcribe(path: Path) -> dict[str, Any]:
     try:
         import whisper
-        import torch
-        model = whisper.load_model("base")
-        return model.transcribe(str(path), fp16=False, verbose=False)
+        model = whisper.load_model(os.getenv("WHISPER_MODEL", "base"))
+        result = model.transcribe(str(path), fp16=False, verbose=False, temperature=0, condition_on_previous_text=True)
+        return {"text": result.get("text", "").strip(), "segments": result.get("segments", [])}
     except Exception as exc:
         print(f"Whisper unavailable/failed: {exc}")
         return {"text": "", "segments": [], "error": str(exc)}
 
+HOOK_WORDS = {"amazing", "important", "secret", "mistake", "problem", "solution", "best", "worst", "never", "always", "how", "why", "truth", "tip", "tips", "learn", "learned", "money", "success", "failure", "hack", "easy", "hard", "avoid", "key", "reason", "idea", "powerful", "actually", "real", "wrong", "simple", "nobody", "everyone", "first", "only", "instead", "remember", "warning", "free"}
+FILLER_WORDS = {"um", "uh", "erm", "hmm", "like", "you know"}
 
-def score_segment(text: str) -> int:
-    words = {"amazing", "important", "secret", "mistake", "problem", "solution", "best", "worst", "never", "always", "how", "why", "truth", "tip", "tips", "learn", "learned", "money", "success", "failure", "hack", "easy", "hard", "avoid", "key", "reason", "idea", "powerful", "actually", "real", "wrong", "simple", "nobody"}
+def score_text(text: str) -> float:
     lower = text.lower()
-    score = 45 + sum(4 for w in words if re.search(rf"\b{re.escape(w)}\b", lower))
-    if "?" in text:
-        score += 10
-    if "!" in text:
-        score += 6
-    if len(text) >= 50:
-        score += 5
-    if len(text) >= 100:
-        score += 5
-    if re.search(r"\b\d+\b", text):
-        score += 4
-    if re.search(r"\b(you|your|we|our)\b", lower):
-        score += 4
-    if re.search(r"\b(but|because|therefore|so)\b", lower):
-        score += 3
-    return min(score, 100)
+    words = re.findall(r"[a-zA-Z0-9']+", lower)
+    if not words:
+        return 0.0
+    unique = set(words)
+    score = 45.0
+    score += min(25, sum(4 for w in HOOK_WORDS if w in unique))
+    score += 8 if "?" in text else 0
+    score += 5 if "!" in text else 0
+    score += 5 if len(words) >= 18 else 0
+    score += 4 if len(words) >= 35 else 0
+    score += 4 if any(w.isdigit() for w in words) else 0
+    score += 4 if any(w in {"you", "your", "we", "our"} for w in unique) else 0
+    score += 3 if any(w in {"but", "because", "therefore", "so"} for w in unique) else 0
+    score -= min(12, sum(lower.count(w) for w in FILLER_WORDS) * 2)
+    return round(max(0, min(100, score)), 1)
 
-
-def detect_highlights(transcription: dict, video_duration: float) -> list[dict]:
-    segments = transcription.get("segments", [])
+def build_candidates(transcription: dict[str, Any], duration: float, target: int, clip_duration: int) -> list[dict[str, Any]]:
+    segments = [s for s in transcription.get("segments", []) if str(s.get("text", "")).strip()]
+    if not segments:
+        return []
     candidates = []
-    for seg in segments:
-        text = str(seg.get("text", "")).strip()
-        if not text:
-            continue
-        start = float(seg.get("start", 0))
-        end = float(seg.get("end", start + 1))
-        candidates.append({"start": start, "end": end, "text": text, "score": score_segment(text)})
-
-    if not candidates:
-        return [{"start": 0, "duration": min(video_duration, 30), "end": min(video_duration, 30), "text": "", "score": 50}]
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    for i, seg in enumerate(segments):
+        anchor_start = float(seg.get("start", 0))
+        anchor_end = float(seg.get("end", anchor_start + 1))
+        start = max(0.0, anchor_start - 6)
+        if duration >= clip_duration:
+            start = min(start, duration - clip_duration)
+            end = start + clip_duration
+        else:
+            end = duration
+            start = 0.0
+        nearby = [s for s in segments if float(s.get("end", 0)) >= start and float(s.get("start", 0)) <= end]
+        text = " ".join(str(s.get("text", "")).strip() for s in nearby).strip() or str(seg.get("text", "")).strip()
+        candidates.append({"start": start, "end": end, "text": text, "score": score_text(text), "anchor": i})
+    candidates.sort(key=lambda x: (x["score"], len(x["text"])), reverse=True)
     selected = []
     for c in candidates:
-        start = max(0.0, c["start"] - 5)
-        end = min(video_duration, c["end"] + 10)
-        if end - start < 15:
-            end = min(video_duration, start + 30)
-        end = min(end, start + 45)
-        if end - start < 8:
+        if any(c["start"] < x["end"] and c["end"] > x["start"] for x in selected):
             continue
-        if any(start < x["end"] and end > x["start"] for x in selected):
-            continue
-        selected.append({"start": start, "duration": end - start, "end": end, "text": c["text"], "score": c["score"]})
-        if len(selected) >= MAX_CLIPS:
+        selected.append(c)
+        if len(selected) >= target:
             break
     selected.sort(key=lambda x: x["start"])
-    return selected or [{"start": 0, "duration": min(video_duration, 30), "end": min(video_duration, 30), "text": "", "score": 50}]
+    return selected
 
+def fallback_candidates(duration: float, target: int, clip_duration: int) -> list[dict[str, Any]]:
+    if duration <= 0:
+        return []
+    length = min(duration, clip_duration)
+    count = min(target, max(1, int((duration + length - 1) // length)))
+    usable = max(0.0, duration - length)
+    starts = [0.0] if count == 1 else [usable * i / (count - 1) for i in range(count)]
+    return [{"start": round(s, 2), "end": round(min(duration, s + length), 2), "text": "", "score": 50.0, "anchor": i} for i, s in enumerate(starts)]
 
-def make_ass(text: str, path: Path) -> None:
-    safe = text.replace("{", "(").replace("}", ")").replace("\\", "\\\\")
-    lines = [line.strip() for line in re.split(r"(?<=[.!?])\s+", safe) if line.strip()]
-    if not lines:
-        path.write_text("", encoding="utf-8")
-        return
-    chunks, chunk = [], ""
-    for line in lines:
-        if len(chunk) + len(line) > 70 and chunk:
-            chunks.append(chunk)
-            chunk = line
-        else:
-            chunk = f"{chunk} {line}".strip()
-    if chunk:
-        chunks.append(chunk)
-    ass = """[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,1,5,2,2,60,60,250,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
-    ass += "Dialogue: 0,0:00:00.00,9:59:59.00,Default,,0,0,0,," + "\\N".join(chunks[:5]) + "\n"
-    path.write_text(ass, encoding="utf-8")
+def make_srt(transcription: dict[str, Any], start: float, end: float, path: Path) -> None:
+    def timestamp(seconds: float) -> str:
+        total_ms = max(0, int(round(seconds * 1000)))
+        h, rem = divmod(total_ms, 3600000)
+        m, rem = divmod(rem, 60000)
+        s, ms = divmod(rem, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    rows, number = [], 1
+    for segment in transcription.get("segments", []):
+        s, e = float(segment.get("start", 0)), float(segment.get("end", 0))
+        if e <= start or s >= end:
+            continue
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        ls, le = max(0, s - start), min(end - start, e - start)
+        rows.append(f"{number}\n{timestamp(ls)} --> {timestamp(max(ls + 0.2, le))}\n{text}\n")
+        number += 1
+    path.write_text("\n".join(rows), encoding="utf-8")
 
-
-def create_short(input_file: Path, output_file: Path, start: float, duration: float, caption: str) -> None:
-    with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tmp:
-        ass_path = Path(tmp.name)
+def create_short(input_file: Path, output_file: Path, start: float, duration: float, transcription: dict[str, Any], captions: bool) -> None:
+    srt_path = None
     try:
-        make_ass(caption, ass_path)
-        vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-        if caption:
-            vf += f",subtitles='{str(ass_path).replace(chr(92), '/')}'"
-        run_ffmpeg([
-            "-y", "-ss", str(start), "-i", str(input_file), "-t", str(duration),
-            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output_file)
-        ])
+        filters = ["scale=1080:1920:force_original_aspect_ratio=increase", "crop=1080:1920"]
+        if captions and transcription.get("segments"):
+            with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
+                srt_path = Path(tmp.name)
+            make_srt(transcription, start, start + duration, srt_path)
+            subtitle_path = str(srt_path).replace("\\", "/").replace(":", "\\:")
+            filters.append("subtitles=" + subtitle_path + ":force_style='FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Alignment=2,MarginV=180,Bold=1'")
+        run_ffmpeg(["-y", "-ss", f"{start:.3f}", "-i", str(input_file), "-t", f"{duration:.3f}", "-vf", ",".join(filters), "-c:v", "libx264", "-preset", os.getenv("FFMPEG_PRESET", "veryfast"), "-crf", os.getenv("FFMPEG_CRF", "23"), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output_file)])
     finally:
-        ass_path.unlink(missing_ok=True)
-
+        if srt_path:
+            srt_path.unlink(missing_ok=True)
 
 def validate_youtube_url(url: str) -> bool:
-    return bool(re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)(/|$)", url, re.I))
+    return bool(re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)(/|$)", url.strip(), re.IGNORECASE))
 
-
-def _youtube_runtime_args() -> list[str]:
+def youtube_runtime_args() -> list[str]:
     try:
-        probe = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if probe.returncode == 0:
-            return ["deno"]
+        result = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return ["deno"] if result.returncode == 0 else []
     except FileNotFoundError:
-        pass
-    return []
+        return []
 
-
-def _yt_dlp_format_candidates() -> list[str]:
-    return [
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]",
-        "best[height<=1080][ext=mp4]/best[height<=720]/best",
-    ]
-
-
-def _download_with_ytdlp(yt_dlp, url: str, template: str, format_selector: str, runtime: list[str], destination: Path) -> list[Path]:
-    opts = {
-        "format": format_selector,
-        "outtmpl": template,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": False,
-        "no_warnings": False,
-        "ffmpeg_location": str(FFMPEG),
-        "restrictfilenames": True,
-        "paths": {"home": str(destination.parent)},
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-    }
-    if runtime:
-        opts["js_runtimes"] = {runtime[0]: {}}
-
-    before = {p.resolve() for p in destination.parent.glob(destination.stem + ".*") if p.is_file()}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        prepared = Path(ydl.prepare_filename(info))
-
-    candidates = [
-        destination,
-        destination.with_suffix(".mp4"),
-        prepared,
-        prepared.with_suffix(".mp4"),
-        prepared.with_suffix(".webm"),
-        prepared.with_suffix(".mkv"),
-        prepared.with_suffix(".m4v"),
-    ]
-    candidates.extend(destination.parent.glob(destination.stem + ".*"))
-    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
-    if not candidates:
-        after = {p.resolve() for p in destination.parent.glob(destination.stem + ".*") if p.is_file()}
-        for p in after - before:
-            pp = Path(p)
-            if pp.suffix.lower() in ALLOWED_EXTENSIONS:
-                candidates.append(pp)
-    return candidates
-
-
-def download_youtube(url: str, destination: Path) -> None:
+def download_youtube(url: str, destination: Path, job_id: str) -> None:
     try:
         import yt_dlp
-    except ImportError:
-        raise RuntimeError("yt-dlp is not installed. Run: python -m pip install yt-dlp")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp is missing. Run: python -m pip install -r requirements.txt") from exc
     template = str(destination.with_suffix("")) + ".%(ext)s"
-    runtime = _youtube_runtime_args()
-    errors = []
-
-    for format_selector in _yt_dlp_format_candidates():
+    runtime = youtube_runtime_args()
+    selectors = [
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]",
+        "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "best[height<=1080]/best",
+    ]
+    last_error = "No compatible YouTube format was found."
+    for selector in selectors:
         try:
-            candidates = _download_with_ytdlp(yt_dlp, url, template, format_selector, runtime, destination)
-            if candidates:
-                best = max(candidates, key=lambda p: p.stat().st_size)
-                if best.resolve() != destination.resolve():
-                    shutil.move(str(best), str(destination))
-                return
+            opts: dict[str, Any] = {"format": selector, "outtmpl": template, "merge_output_format": "mp4", "noplaylist": True, "ffmpeg_location": FFMPEG, "restrictfilenames": True, "quiet": False, "no_warnings": False}
+            if runtime:
+                opts["js_runtimes"] = {runtime[0]: {}}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                prepared = Path(ydl.prepare_filename(info))
+            candidates = [destination, prepared, prepared.with_suffix(".mp4"), prepared.with_suffix(".mkv"), prepared.with_suffix(".webm"), prepared.with_suffix(".m4v")]
+            candidates += list(destination.parent.glob(destination.stem + ".*"))
+            candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
+            if not candidates:
+                raise RuntimeError("YouTube download completed but no video file was produced.")
+            best = max(candidates, key=lambda p: p.stat().st_size)
+            if best.resolve() != destination.resolve():
+                if destination.exists(): destination.unlink()
+                shutil.move(str(best), str(destination))
+            return
         except Exception as exc:
-            errors.append(f"{format_selector}: {exc}")
+            last_error = str(exc)
+            update_job(job_id, message="Trying another YouTube format…")
+    note = " Install Deno for more reliable current YouTube extraction." if not runtime else ""
+    raise RuntimeError(last_error + note)
 
-    detail = errors[-1] if errors else "no video file was produced"
-    hint = " Deno can improve extraction of current YouTube formats." if not runtime else ""
-    raise RuntimeError(f"YouTube download failed: {detail}.{hint}")
-
-
-def process_file(input_file: Path, job_id: str) -> dict:
-    duration, audio = probe_video(input_file)
-    transcription = transcribe(input_file) if audio else {"text": "", "segments": []}
-    highlights = detect_highlights(transcription, duration)
+def process_file(input_file: Path, job_id: str, options: ProcessOptions) -> dict[str, Any]:
+    update_job(job_id, progress=35, message="Inspecting video…")
+    duration, has_audio, width, height = probe_video(input_file)
+    update_job(job_id, progress=48, message="Transcribing with local Whisper…")
+    transcription = transcribe(input_file) if has_audio else {"text": "", "segments": []}
+    update_job(job_id, progress=62, message="Finding the strongest moments…")
+    highlights = build_candidates(transcription, duration, options.num_clips, options.clip_duration) or fallback_candidates(duration, options.num_clips, options.clip_duration)
+    update_job(job_id, progress=70, message="Rendering vertical Shorts…")
     clips = []
-    for i, h in enumerate(highlights, 1):
-        output = OUTPUT_DIR / f"{job_id}_clip_{i}.mp4"
-        create_short(input_file, output, h["start"], h["duration"], h["text"])
-        clips.append({
-            "clip_number": i,
-            "title": f"AI Short #{i}",
-            "score": h["score"],
-            "text": h["text"],
-            "start": round(h["start"], 2),
-            "duration": round(h["duration"], 2),
-            "download_url": f"/download/{output.name}",
-        })
-    result = {"status": "completed", "job_id": job_id, "has_audio": audio, "transcript": transcription.get("text", ""), "number_of_clips": len(clips), "clips": clips}
+    for index, highlight in enumerate(highlights, 1):
+        start = float(highlight["start"])
+        end = min(duration, start + options.clip_duration)
+        actual_duration = max(1.0, end - start)
+        output = OUTPUT_DIR / f"{job_id}_clip_{index}.mp4"
+        create_short(input_file, output, start, actual_duration, transcription, options.captions)
+        clips.append({"clip_number": index, "title": f"AI Short #{index}", "score": highlight["score"], "text": highlight["text"], "start": round(start, 2), "duration": round(actual_duration, 2), "download_url": f"/download/{output.name}"})
+        update_job(job_id, progress=70 + int(index / max(1, len(highlights)) * 28), message=f"Rendered Short {index} of {len(highlights)}…")
+    result: dict[str, Any] = {"status": "completed", "job_id": job_id, "source_duration": round(duration, 2), "source_resolution": f"{width}x{height}", "has_audio": has_audio, "transcript": transcription.get("text", ""), "number_of_clips": len(clips), "clips": clips, "settings": options.model_dump()}
     if transcription.get("error"):
-        result["warning"] = "Whisper could not transcribe this video: " + transcription["error"]
+        result["warning"] = "Whisper could not transcribe this video. The app used fallback clip selection. Details: " + transcription["error"]
     return result
 
+def run_job(job_id: str, input_file: Path, options: ProcessOptions) -> None:
+    try:
+        update_job(job_id, status="processing", progress=32, message="Starting AI analysis…")
+        result = process_file(input_file, job_id, options)
+        update_job(job_id, status="completed", progress=100, message="Process complete", result=result)
+    except Exception as exc:
+        print(f"Job {job_id} failed: {exc}")
+        update_job(job_id, status="failed", progress=0, message="Processing failed", error=str(exc))
+    finally:
+        input_file.unlink(missing_ok=True)
 
 @app.get("/")
-def home():
-    return {"status": "running", "service": "ClipForge AI", "version": "1.5.0"}
-
+def home() -> dict[str, str]:
+    return {"status": "running", "service": "ClipForge AI", "version": "2.0.0"}
 
 @app.get("/health")
-def health():
-    return {"status": "healthy", "ffmpeg": Path(FFMPEG).exists(), "deno": bool(_youtube_runtime_args())}
+def health() -> dict[str, Any]:
+    return {"status": "healthy", "ffmpeg": Path(FFMPEG).exists(), "ffmpeg_path": FFMPEG, "whisper": module_available("whisper"), "yt_dlp": module_available("yt_dlp"), "deno": bool(youtube_runtime_args())}
 
+def module_available(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
 
 @app.post("/process")
-async def process_video(file: UploadFile = File(...)):
-    job_id = str(uuid.uuid4())
+async def process_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...), num_clips: int = 3, clip_duration: int = 30, captions: bool = True) -> dict[str, Any]:
+    options = ProcessOptions(num_clips=num_clips, clip_duration=clip_duration, captions=captions)
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, "Unsupported video format")
+    job_id = str(uuid.uuid4())
     input_file = UPLOAD_DIR / f"{job_id}{extension}"
     total = 0
     try:
@@ -292,37 +287,52 @@ async def process_video(file: UploadFile = File(...)):
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
+                    input_file.unlink(missing_ok=True)
                     raise HTTPException(413, "Video is larger than 2 GB")
                 buffer.write(chunk)
-        return process_file(input_file, job_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"Processing error: {exc}")
-        raise HTTPException(500, f"Video processing failed: {exc}")
-
+    finally:
+        await file.close()
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "queued", "progress": 5, "message": "Queued for processing…"}
+    background_tasks.add_task(run_job, job_id, input_file, options)
+    return {"status": "queued", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 @app.post("/process-url")
-def process_youtube(request: YouTubeRequest):
+def process_youtube(request: YouTubeRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
     url = str(request.url)
     if not validate_youtube_url(url):
-        raise HTTPException(400, "Only YouTube URLs are supported")
+        raise HTTPException(400, "Only YouTube URLs are supported.")
     job_id = str(uuid.uuid4())
     input_file = UPLOAD_DIR / f"{job_id}.mp4"
-    try:
-        print(f"Downloading YouTube video for job {job_id}")
-        download_youtube(url, input_file)
-        return process_file(input_file, job_id)
-    except Exception as exc:
-        print(f"YouTube processing error: {exc}")
-        raise HTTPException(500, f"YouTube processing failed: {exc}")
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "queued", "progress": 5, "message": "Queued for YouTube download…"}
+    def download_and_process() -> None:
+        try:
+            update_job(job_id, status="processing", progress=8, message="Downloading YouTube video…")
+            download_youtube(url, input_file, job_id)
+            update_job(job_id, progress=30, message="Download complete. Starting AI analysis…")
+            run_job(job_id, input_file, request.options)
+        except Exception as exc:
+            print(f"YouTube job {job_id} failed: {exc}")
+            update_job(job_id, status="failed", progress=0, message="YouTube processing failed", error=str(exc))
+            input_file.unlink(missing_ok=True)
+    background_tasks.add_task(download_and_process)
+    return {"status": "queued", "job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> dict[str, Any]:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return {"job_id": job_id, **job}
 
 @app.get("/download/{filename}")
-def download_clip(filename: str):
-    candidate = (OUTPUT_DIR / filename).resolve()
+def download_clip(filename: str) -> FileResponse:
+    candidate = (OUTPUT_DIR / Path(filename).name).resolve()
     if OUTPUT_DIR.resolve() not in candidate.parents:
         raise HTTPException(403, "Invalid file path")
     if not candidate.is_file():
         raise HTTPException(404, "Clip not found")
     return FileResponse(candidate, media_type="video/mp4", filename=candidate.name)
+'''}

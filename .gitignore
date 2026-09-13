@@ -1,15 +1,12 @@
 node_modules/
 dist/
 .env
-.venv/
-venv/
+*.log
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 uploads/*
 outputs/*
 !uploads/.gitkeep
 !outputs/.gitkeep
+.vscode/
 .DS_Store
-*.log
