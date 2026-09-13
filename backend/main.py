@@ -22,7 +22,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLIPS = 5
 
-app = FastAPI(title="ClipForge AI", version="1.3.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
+app = FastAPI(title="ClipForge AI", version="1.4.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -69,13 +69,20 @@ def score_segment(text: str) -> int:
     words = {"amazing", "important", "secret", "mistake", "problem", "solution", "best", "worst", "never", "always", "how", "why", "truth", "tip", "tips", "learn", "learned", "money", "success", "failure", "hack", "easy", "hard", "avoid", "key", "reason", "idea", "powerful", "actually", "real", "wrong", "simple", "nobody"}
     lower = text.lower()
     score = 45 + sum(4 for w in words if re.search(rf"\b{re.escape(w)}\b", lower))
-    if "?" in text: score += 10
-    if "!" in text: score += 6
-    if len(text) >= 50: score += 5
-    if len(text) >= 100: score += 5
-    if re.search(r"\b\d+\b", text): score += 4
-    if re.search(r"\b(you|your|we|our)\b", lower): score += 4
-    if re.search(r"\b(but|because|therefore|so)\b", lower): score += 3
+    if "?" in text:
+        score += 10
+    if "!" in text:
+        score += 6
+    if len(text) >= 50:
+        score += 5
+    if len(text) >= 100:
+        score += 5
+    if re.search(r"\b\d+\b", text):
+        score += 4
+    if re.search(r"\b(you|your|we|our)\b", lower):
+        score += 4
+    if re.search(r"\b(but|because|therefore|so)\b", lower):
+        score += 3
     return min(score, 100)
 
 
@@ -125,7 +132,8 @@ def make_ass(text: str, path: Path) -> None:
             chunk = line
         else:
             chunk = f"{chunk} {line}".strip()
-    if chunk: chunks.append(chunk)
+    if chunk:
+        chunks.append(chunk)
     ass = """[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,1,5,2,2,60,60,250,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"""
     ass += "Dialogue: 0,0:00:00.00,9:59:59.00,Default,,0,0,0,," + "\\N".join(chunks[:5]) + "\n"
     path.write_text(ass, encoding="utf-8")
@@ -153,7 +161,6 @@ def validate_youtube_url(url: str) -> bool:
 
 
 def _youtube_runtime_args() -> list[str]:
-    """Use Deno when installed; yt-dlp can use it for YouTube JS challenges."""
     try:
         probe = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if probe.returncode == 0:
@@ -164,17 +171,15 @@ def _youtube_runtime_args() -> list[str]:
 
 
 def _yt_dlp_format_candidates() -> list[str]:
-    # Prefer formats that can be downloaded as one file. Only request a
-    # separate audio stream when it is available, so the backend can still
-    # work on systems where ffmpeg is bundled rather than installed globally.
     return [
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=720]/b",
-        "b[ext=mp4]/b",
-        "b",
+        # Best available separate video + English/original audio.
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]",
+        # Single-file fallback for environments where only muxed streams are exposed.
+        "best[height<=1080][ext=mp4]/best[height<=720]/best",
     ]
 
 
-def _download_with_ytdlp(yt_dlp, url: str, template: str, format_selector: str, runtime: list[str]) -> Path:
+def _download_with_ytdlp(yt_dlp, url: str, template: str, format_selector: str, runtime: list[str], destination: Path) -> list[Path]:
     opts = {
         "format": format_selector,
         "outtmpl": template,
@@ -184,16 +189,35 @@ def _download_with_ytdlp(yt_dlp, url: str, template: str, format_selector: str, 
         "no_warnings": False,
         "ffmpeg_location": str(FFMPEG),
         "restrictfilenames": True,
-        "paths": {"home": str(Path(template).parent)},
+        "paths": {"home": str(destination.parent)},
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
     }
     if runtime:
         opts["js_runtimes"] = {runtime[0]: {}}
 
+    before = {p.resolve() for p in destination.parent.glob(destination.stem + ".*") if p.is_file()}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        requested = Path(ydl.prepare_filename(info))
+        prepared = Path(ydl.prepare_filename(info))
 
-    return requested
+    candidates = [
+        destination,
+        destination.with_suffix(".mp4"),
+        prepared,
+        prepared.with_suffix(".mp4"),
+        prepared.with_suffix(".webm"),
+        prepared.with_suffix(".mkv"),
+        prepared.with_suffix(".m4v"),
+    ]
+    candidates.extend(destination.parent.glob(destination.stem + ".*"))
+    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
+    if not candidates:
+        after = {p.resolve() for p in destination.parent.glob(destination.stem + ".*") if p.is_file()}
+        for p in after - before:
+            pp = Path(p)
+            if pp.suffix.lower() in ALLOWED_EXTENSIONS:
+                candidates.append(pp)
+    return candidates
 
 
 def download_youtube(url: str, destination: Path) -> None:
@@ -203,40 +227,24 @@ def download_youtube(url: str, destination: Path) -> None:
         raise RuntimeError("yt-dlp is not installed. Run: python -m pip install yt-dlp")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    stem = destination.with_suffix("")
-    template = str(stem) + ".%(ext)s"
+    template = str(destination.with_suffix("")) + ".%(ext)s"
     runtime = _youtube_runtime_args()
     errors = []
 
     for format_selector in _yt_dlp_format_candidates():
-        before = set(destination.parent.glob(stem.name + ".*"))
         try:
-            _download_with_ytdlp(yt_dlp, url, template, format_selector, runtime)
+            candidates = _download_with_ytdlp(yt_dlp, url, template, format_selector, runtime, destination)
+            if candidates:
+                best = max(candidates, key=lambda p: p.stat().st_size)
+                if best.resolve() != destination.resolve():
+                    shutil.move(str(best), str(destination))
+                return
         except Exception as exc:
             errors.append(f"{format_selector}: {exc}")
-            continue
 
-        candidates = [
-            stem.with_suffix(".mp4"),
-            stem.with_suffix(".webm"),
-            stem.with_suffix(".m4v"),
-            stem.with_suffix(".mkv"),
-        ]
-        candidates.extend(destination.parent.glob(stem.name + ".*"))
-        candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
-        if not candidates:
-            after = set(destination.parent.glob(stem.name + ".*"))
-            new_files = [p for p in (after - before) if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
-            candidates.extend(new_files)
-        if candidates:
-            best = max(candidates, key=lambda p: p.stat().st_size)
-            if best.resolve() != destination.resolve():
-                shutil.move(str(best), str(destination))
-            return
-
-    runtime_hint = " Deno is recommended for current YouTube extraction." if not runtime else ""
     detail = errors[-1] if errors else "no video file was produced"
-    raise RuntimeError(f"YouTube download failed: {detail}.{runtime_hint}")
+    hint = " Deno can improve extraction of current YouTube formats." if not runtime else ""
+    raise RuntimeError(f"YouTube download failed: {detail}.{hint}")
 
 
 def process_file(input_file: Path, job_id: str) -> dict:
@@ -261,7 +269,7 @@ def process_file(input_file: Path, job_id: str) -> dict:
 
 @app.get("/")
 def home():
-    return {"status": "running", "service": "ClipForge AI", "version": "1.3.0"}
+    return {"status": "running", "service": "ClipForge AI", "version": "1.4.0"}
 
 
 @app.get("/health")
