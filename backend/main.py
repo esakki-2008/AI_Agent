@@ -22,7 +22,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLIPS = 5
 
-app = FastAPI(title="ClipForge AI", version="1.1.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
+app = FastAPI(title="ClipForge AI", version="1.2.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -66,7 +66,7 @@ def transcribe(path: Path) -> dict:
 
 
 def score_segment(text: str) -> int:
-    words = {"amazing", "important", "secret", "mistake", "problem", "solution", "best", "worst", "never", "always", "how", "why", "truth", "tip", "tips", "learn", "learned", "money", "success", "failure", "hack", "easy", "hard", "avoid", "key", "reason", "idea", "powerful", "actually", "real", "wrong", "secret", "simple", "nobody"}
+    words = {"amazing", "important", "secret", "mistake", "problem", "solution", "best", "worst", "never", "always", "how", "why", "truth", "tip", "tips", "learn", "learned", "money", "success", "failure", "hack", "easy", "hard", "avoid", "key", "reason", "idea", "powerful", "actually", "real", "wrong", "simple", "nobody"}
     lower = text.lower()
     score = 45 + sum(4 for w in words if re.search(rf"\b{re.escape(w)}\b", lower))
     if "?" in text: score += 10
@@ -152,6 +152,17 @@ def validate_youtube_url(url: str) -> bool:
     return bool(re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)(/|$)", url, re.I))
 
 
+def _youtube_runtime_args() -> list[str]:
+    """Use Deno when installed; yt-dlp can use it for YouTube JS challenges."""
+    try:
+        probe = subprocess.run(["deno", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            return ["deno"]
+    except FileNotFoundError:
+        pass
+    return []
+
+
 def download_youtube(url: str, destination: Path) -> None:
     try:
         import yt_dlp
@@ -159,24 +170,40 @@ def download_youtube(url: str, destination: Path) -> None:
         raise RuntimeError("yt-dlp is not installed. Run: python -m pip install -r requirements.txt")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    template = str(destination.with_suffix("")) + ".%(ext)s"
+    stem = destination.with_suffix("")
+    template = str(stem) + ".%(ext)s"
     opts = {
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=720]/b",
         "outtmpl": template,
         "merge_output_format": "mp4",
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "ffmpeg_location": FFMPEG,
+        "quiet": False,
+        "no_warnings": False,
+        "ffmpeg_location": str(FFMPEG),
         "restrictfilenames": True,
+        "paths": {"home": str(destination.parent)},
     }
+    runtime = _youtube_runtime_args()
+    if runtime:
+        opts["js_runtimes"] = {runtime[0]: {}}
+
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    candidates = list(destination.parent.glob(destination.name + ".*"))
-    candidates = [p for p in candidates if p.suffix.lower() in ALLOWED_EXTENSIONS]
+        info = ydl.extract_info(url, download=True)
+        requested = Path(ydl.prepare_filename(info))
+
+    # Prefer the final merged path, then the prepared path, then any media candidate.
+    candidates = [
+        stem.with_suffix(".mp4"),
+        requested,
+        requested.with_suffix(".mp4"),
+    ]
+    candidates.extend(destination.parent.glob(stem.name + ".*"))
+    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
     if not candidates:
         raise RuntimeError("YouTube download completed but no video file was produced")
-    shutil.move(str(max(candidates, key=lambda p: p.stat().st_size)), str(destination))
+    best = max(candidates, key=lambda p: p.stat().st_size)
+    if best.resolve() != destination.resolve():
+        shutil.move(str(best), str(destination))
 
 
 def process_file(input_file: Path, job_id: str) -> dict:
@@ -201,12 +228,12 @@ def process_file(input_file: Path, job_id: str) -> dict:
 
 @app.get("/")
 def home():
-    return {"status": "running", "service": "ClipForge AI", "version": "1.1.0"}
+    return {"status": "running", "service": "ClipForge AI", "version": "1.2.0"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "ffmpeg": Path(FFMPEG).exists()}
+    return {"status": "healthy", "ffmpeg": Path(FFMPEG).exists(), "deno": bool(_youtube_runtime_args())}
 
 
 @app.post("/process")
