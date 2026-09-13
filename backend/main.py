@@ -22,7 +22,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLIPS = 5
 
-app = FastAPI(title="ClipForge AI", version="1.2.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
+app = FastAPI(title="ClipForge AI", version="1.3.0", description="Turn permitted YouTube videos or uploads into vertical Shorts using local AI.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -163,17 +163,20 @@ def _youtube_runtime_args() -> list[str]:
     return []
 
 
-def download_youtube(url: str, destination: Path) -> None:
-    try:
-        import yt_dlp
-    except ImportError:
-        raise RuntimeError("yt-dlp is not installed. Run: python -m pip install -r requirements.txt")
+def _yt_dlp_format_candidates() -> list[str]:
+    # Prefer formats that can be downloaded as one file. Only request a
+    # separate audio stream when it is available, so the backend can still
+    # work on systems where ffmpeg is bundled rather than installed globally.
+    return [
+        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=720]/b",
+        "b[ext=mp4]/b",
+        "b",
+    ]
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    stem = destination.with_suffix("")
-    template = str(stem) + ".%(ext)s"
+
+def _download_with_ytdlp(yt_dlp, url: str, template: str, format_selector: str, runtime: list[str]) -> Path:
     opts = {
-        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=720]/b",
+        "format": format_selector,
         "outtmpl": template,
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -181,9 +184,8 @@ def download_youtube(url: str, destination: Path) -> None:
         "no_warnings": False,
         "ffmpeg_location": str(FFMPEG),
         "restrictfilenames": True,
-        "paths": {"home": str(destination.parent)},
+        "paths": {"home": str(Path(template).parent)},
     }
-    runtime = _youtube_runtime_args()
     if runtime:
         opts["js_runtimes"] = {runtime[0]: {}}
 
@@ -191,19 +193,50 @@ def download_youtube(url: str, destination: Path) -> None:
         info = ydl.extract_info(url, download=True)
         requested = Path(ydl.prepare_filename(info))
 
-    # Prefer the final merged path, then the prepared path, then any media candidate.
-    candidates = [
-        stem.with_suffix(".mp4"),
-        requested,
-        requested.with_suffix(".mp4"),
-    ]
-    candidates.extend(destination.parent.glob(stem.name + ".*"))
-    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
-    if not candidates:
-        raise RuntimeError("YouTube download completed but no video file was produced")
-    best = max(candidates, key=lambda p: p.stat().st_size)
-    if best.resolve() != destination.resolve():
-        shutil.move(str(best), str(destination))
+    return requested
+
+
+def download_youtube(url: str, destination: Path) -> None:
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp is not installed. Run: python -m pip install yt-dlp")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stem = destination.with_suffix("")
+    template = str(stem) + ".%(ext)s"
+    runtime = _youtube_runtime_args()
+    errors = []
+
+    for format_selector in _yt_dlp_format_candidates():
+        before = set(destination.parent.glob(stem.name + ".*"))
+        try:
+            _download_with_ytdlp(yt_dlp, url, template, format_selector, runtime)
+        except Exception as exc:
+            errors.append(f"{format_selector}: {exc}")
+            continue
+
+        candidates = [
+            stem.with_suffix(".mp4"),
+            stem.with_suffix(".webm"),
+            stem.with_suffix(".m4v"),
+            stem.with_suffix(".mkv"),
+        ]
+        candidates.extend(destination.parent.glob(stem.name + ".*"))
+        candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
+        if not candidates:
+            after = set(destination.parent.glob(stem.name + ".*"))
+            new_files = [p for p in (after - before) if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
+            candidates.extend(new_files)
+        if candidates:
+            best = max(candidates, key=lambda p: p.stat().st_size)
+            if best.resolve() != destination.resolve():
+                shutil.move(str(best), str(destination))
+            return
+
+    runtime_hint = " Deno is recommended for current YouTube extraction." if not runtime else ""
+    detail = errors[-1] if errors else "no video file was produced"
+    raise RuntimeError(f"YouTube download failed: {detail}.{runtime_hint}")
 
 
 def process_file(input_file: Path, job_id: str) -> dict:
@@ -228,7 +261,7 @@ def process_file(input_file: Path, job_id: str) -> dict:
 
 @app.get("/")
 def home():
-    return {"status": "running", "service": "ClipForge AI", "version": "1.2.0"}
+    return {"status": "running", "service": "ClipForge AI", "version": "1.3.0"}
 
 
 @app.get("/health")
