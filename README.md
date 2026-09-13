@@ -1,71 +1,39 @@
-# ClipForge AI — Short Clip Generator
+# ClipForge AI
 
-Turn long-form videos into vertical Shorts with local AI.
+ClipForge AI is a local-first video repurposing MVP: upload a long-form video, transcribe speech with Whisper, score candidate moments, crop them to 9:16, burn captions, and download MP4 Shorts.
 
-## Features
+## Stack
+- React + Vite
+- FastAPI
+- OpenAI Whisper (local)
+- imageio-ffmpeg (bundled FFmpeg binary)
 
-- Upload MP4, MOV, MKV, AVI, WebM, or M4V
-- Automatic audio detection
-- Whisper transcription when speech/audio is available
-- Highlight scoring based on transcript signals
-- Up to 5 clips per video
-- 9:16 vertical 1080x1920 output
-- MP4 export with AAC audio
-- Browser preview and download
-- No paid API key required
+No Ollama and no paid API key are required.
 
-## Architecture
-
-```text
-React + Vite frontend
-        ↓
-FastAPI backend
-        ↓
-Whisper + FFmpeg
-        ↓
-AI highlight selection
-        ↓
-Vertical MP4 clips
-```
-
-## Windows setup
+## Windows quick start
 
 ### Backend
-
 ```powershell
-cd backend
+cd "D:\AI AGENT\backend"
 python -m pip install -r requirements.txt
 python -m uvicorn main:app --reload
 ```
-
-Backend: http://127.0.0.1:8000
-Swagger: http://127.0.0.1:8000/docs
+Open http://127.0.0.1:8000/health
 
 ### Frontend
-
+Open a second terminal:
 ```powershell
-cd frontend
+cd "D:\AI AGENT\frontend"
 npm install
 npm run dev
 ```
+Open http://localhost:5173
 
-Frontend: http://localhost:5173
+## Production notes
+This repository is a production-oriented MVP, not a hosted multi-tenant SaaS yet. Before public deployment, add authentication, persistent job storage, a background queue, object storage, rate limiting, usage quotas, billing, monitoring, HTTPS, and a dedicated FFmpeg/Whisper worker pool.
 
-## FFmpeg
+## Supported uploads
+MP4, MOV, MKV, AVI, WebM and M4V. Maximum upload size is 2 GB.
 
-The backend uses `imageio-ffmpeg`, so a separate system FFmpeg installation is not required.
-
-## Notes
-
-The first Whisper run downloads the selected model. The current MVP uses the `base` model and CPU-safe transcription (`fp16=False`).
-
-## Roadmap
-
-- Word-level animated captions
-- Face-aware smart cropping
-- Hook/title generation
-- Background music
-- Multiple caption styles
-- Job queue and progress tracking
-- Creator accounts and billing
-- Cloud deployment
+## Output
+Clips are 1080x1920 (9:16), H.264 video, AAC audio, optimized for browser playback with `faststart`.
