@@ -1,9 +1,8 @@
 import React from "react";
 
-// Add the public checkout URL here when the product is live.
-// Keeping this separate means the storefront can be connected without
-// changing the payment UI or application logic later.
-export const CHECKOUT_URL = "";
+// Public checkout URL. Leave empty until the final Gumroad product URL exists.
+// This is a public storefront URL, not a secret.
+export const CHECKOUT_URL = import.meta.env.VITE_PURCHASE_URL || "";
 
 export default function PaymentCTA() {
   if (!CHECKOUT_URL) {
