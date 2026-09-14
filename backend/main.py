@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import imageio_ffmpeg
+from dynamic_captions import make_dynamic_ass
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -24,9 +25,6 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 for folder in (UPLOAD_DIR, OUTPUT_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
-# imageio-ffmpeg ships a working FFmpeg binary whose filename is not
-# "ffmpeg.exe".  Whisper's loader invokes "ffmpeg" by name, so expose a
-# Whisper-compatible executable in a small local bin directory.
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 FFMPEG_DIR = Path(FFMPEG).parent
 LOCAL_BIN = BASE_DIR / ".bin"
@@ -50,7 +48,7 @@ MAX_CLIPS = 10
 MIN_CLIP_SECONDS = 15
 MAX_CLIP_SECONDS = 60
 
-app = FastAPI(title="ClipForge AI", version="5.0.1", description="Local AI video repurposing studio")
+app = FastAPI(title="ClipForge AI", version="5.1.0", description="Local AI video repurposing studio")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 JOBS: dict[str, dict[str, Any]] = {}
@@ -60,6 +58,7 @@ class ProcessOptions(BaseModel):
     num_clips: int = Field(5, ge=1, le=MAX_CLIPS)
     clip_duration: int = Field(30, ge=MIN_CLIP_SECONDS, le=MAX_CLIP_SECONDS)
     captions: bool = True
+    dynamic_captions: bool = True
     model: str = Field("base", pattern=r"^(tiny|base|small|medium)$")
     smart_crop: bool = True
     generate_metadata: bool = True
@@ -110,7 +109,7 @@ def transcribe(path: Path, model_name: str, language: str) -> dict[str, Any]:
     try:
         import whisper
         model = whisper.load_model(model_name)
-        kwargs: dict[str, Any] = {"fp16": False, "verbose": False, "temperature": 0, "condition_on_previous_text": True}
+        kwargs: dict[str, Any] = {"fp16": False, "verbose": False, "temperature": 0, "condition_on_previous_text": True, "word_timestamps": True}
         if language != "auto":
             kwargs["language"] = language
         result = model.transcribe(str(path), **kwargs)
@@ -205,20 +204,27 @@ def create_thumbnail(input_file: Path, output_file: Path, start: float, smart_cr
     run_ffmpeg(["-y", "-ss", f"{start:.3f}", "-i", str(input_file), "-frames:v", "1", "-vf", video_filter(smart_crop, crop_mode), str(output_file)])
 
 def create_short(input_file: Path, output_file: Path, start: float, duration: float, transcription: dict[str, Any], options: ProcessOptions) -> None:
-    srt_path = None
+    caption_path = None
     try:
         filters = [video_filter(options.smart_crop, options.crop_mode)]
         if options.captions and transcription.get("segments"):
-            with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp: srt_path = Path(tmp.name)
-            make_srt(transcription, start, start + duration, srt_path)
-            sub = str(srt_path).replace("\\", "/").replace(":", "\\:")
-            filters.append("subtitles=" + sub + ":force_style='" + caption_style(options.caption_style) + "'")
+            if options.dynamic_captions:
+                with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tmp:
+                    caption_path = Path(tmp.name)
+                if not make_dynamic_ass(transcription, start, start + duration, caption_path, options.caption_style):
+                    caption_path.unlink(missing_ok=True); caption_path = None
+            if caption_path is None:
+                with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
+                    caption_path = Path(tmp.name)
+                make_srt(transcription, start, start + duration, caption_path)
+            sub = str(caption_path).replace("\\", "/").replace(":", "\\:")
+            filters.append("subtitles=" + sub + (":force_style='" + caption_style(options.caption_style) + "'" if caption_path.suffix == ".srt" else ""))
         crf = {"standard": "26", "high": "23", "max": "20"}[options.quality]
         args = ["-y", "-ss", f"{start:.3f}", "-i", str(input_file), "-t", f"{duration:.3f}", "-vf", ",".join(filters), "-c:v", "libx264", "-preset", os.getenv("FFMPEG_PRESET", "veryfast"), "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k"]
         if options.normalize_audio: args += ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
         args += ["-movflags", "+faststart", str(output_file)]; run_ffmpeg(args)
     finally:
-        if srt_path: srt_path.unlink(missing_ok=True)
+        if caption_path: caption_path.unlink(missing_ok=True)
 
 def validate_youtube_url(url: str) -> bool: return bool(re.match(r"^https?://(www\\.)?(youtube\\.com|youtu\\.be)(/|$)", url.strip(), re.I))
 
@@ -250,8 +256,6 @@ def download_youtube(url: str, destination: Path, job_id: str) -> None:
             last_error = str(exc); update_job(job_id, message="Trying a compatible YouTube format…")
     raise RuntimeError(last_error + (" Install Deno for more reliable current YouTube extraction." if not runtime else ""))
 
-# Remaining API/job functions are intentionally kept below the existing implementation.
-
 def process_file(input_file: Path, job_id: str, options: ProcessOptions) -> dict[str, Any]:
     update_job(job_id, progress=35, message="Inspecting video and audio…"); duration, has_audio, width, height = probe_video(input_file)
     update_job(job_id, progress=48, message=f"Transcribing with local Whisper ({options.model})…")
@@ -265,7 +269,7 @@ def process_file(input_file: Path, job_id: str, options: ProcessOptions) -> dict
         try: create_thumbnail(input_file, thumb, start, options.smart_crop, options.crop_mode)
         except Exception: thumb = None
         metadata = make_metadata(h["text"], index) if options.generate_metadata else {}
-        clips.append({"clip_number": index, "title": metadata.get("title", f"AI Short #{index}"), "score": h["score"], "text": h["text"], "start": round(start, 2), "end": round(end, 2), "duration": round(actual, 2), "download_url": f"/download/{output.name}", "thumbnail_url": f"/download/{thumb.name}" if thumb else None, "metadata": metadata, "format": "9:16", "resolution": "1080x1920"})
+        clips.append({"clip_number": index, "title": metadata.get("title", f"AI Short #{index}"), "score": h["score"], "text": h["text"], "start": round(start, 2), "end": round(end, 2), "duration": round(actual, 2), "download_url": f"/download/{output.name}", "thumbnail_url": f"/download/{thumb.name}" if thumb else None, "metadata": metadata, "format": "9:16", "resolution": "1080x1920", "captions": "dynamic-word-level" if options.dynamic_captions and options.captions and transcription.get("segments") else "standard"})
         update_job(job_id, progress=min(95, 70 + int(index / max(1, len(highlights)) * 25)), message=f"Rendered clip {index}/{len(highlights)}")
     manifest = {"job_id": job_id, "source": input_file.name, "source_duration": duration, "source_resolution": f"{width}x{height}", "output_format": "9:16", "output_resolution": "1080x1920", "whisper": transcription.get("language", "unknown"), "transcription_error": transcription.get("error"), "settings": options.model_dump(), "clips": clips}
     manifest_path = OUTPUT_DIR / f"{job_id}_manifest.json"; manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -286,13 +290,13 @@ def run_job(job_id: str, input_file: Path, options: ProcessOptions) -> None:
         input_file.unlink(missing_ok=True)
 
 @app.get("/")
-def root(): return {"name": "ClipForge AI", "version": "5.0.1", "format": "9:16", "resolution": "1080x1920", "whisper_ffmpeg": WHISPER_FFMPEG.exists()}
+def root(): return {"name": "ClipForge AI", "version": "5.1.0", "format": "9:16", "resolution": "1080x1920", "whisper_ffmpeg": WHISPER_FFMPEG.exists(), "dynamic_captions": True}
 
 @app.get("/health")
-def health(): return {"status": "ok", "version": "5.0.1", "ffmpeg": Path(FFMPEG).name, "whisper_ffmpeg": WHISPER_FFMPEG.exists(), "whisper": module_available("whisper"), "features": ["local-whisper", "hook-ranking", "filler-reduction", "captions", "9:16", "1080x1920", "blur-background", "audio-normalization", "quality-presets", "metadata", "thumbnails", "zip-export"]}
+def health(): return {"status": "ok", "version": "5.1.0", "ffmpeg": Path(FFMPEG).name, "whisper_ffmpeg": WHISPER_FFMPEG.exists(), "whisper": module_available("whisper"), "dynamic_captions": True, "features": ["local-whisper", "word-timestamps", "dynamic-karaoke-captions", "hook-ranking", "filler-reduction", "captions", "9:16", "1080x1920", "blur-background", "audio-normalization", "quality-presets", "metadata", "thumbnails", "zip-export"]}
 
 @app.post("/process")
-async def process(background_tasks: BackgroundTasks, file: UploadFile = File(...), options: str = "{}"):
+async def process(background_tasks: BackgroundTasks, file: UploadFile = File(...), options: str = "{}"): 
     suffix = Path(file.filename or "video.mp4").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS: raise HTTPException(400, "Unsupported video format")
     try: opts = ProcessOptions.model_validate_json(options)
