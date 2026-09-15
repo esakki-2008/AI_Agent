@@ -1,8 +1,9 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
-import App from './App'
+import Storefront from './Storefront'
 import './style.css'
+import './payment.css'
 
 createRoot(document.getElementById('root')).render(
-  <React.StrictMode><App /></React.StrictMode>
+  <React.StrictMode><Storefront /></React.StrictMode>
 )
